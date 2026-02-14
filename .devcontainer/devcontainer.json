@@ -1,0 +1,19 @@
+{
+  "name": "Konwerter PDF/DOCX do Markdown",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "forwardPorts": [8501],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  },
+  "postStartCommand": "streamlit run app/main.py --server.address=0.0.0.0"
+}

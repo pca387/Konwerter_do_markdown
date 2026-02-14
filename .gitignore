@@ -1,1 +1,9 @@
 claude-code-infrastructure-showcase/
+__pycache__/
+*.pyc
+.env
+output/
+temp/
+*.egg-info/
+.venv/
+.DS_Store

@@ -1,0 +1,10 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
