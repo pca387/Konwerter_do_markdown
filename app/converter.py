@@ -30,8 +30,15 @@ _MEANINGFUL_RE = re.compile(
 )
 
 
-def _get_dominant_font(doc: pymupdf.Document) -> str:
-    """Return the single most frequently used font name across the document."""
+_OCR_FONTS = {"glyphlessfont", "cid", "invisible"}
+
+
+def _get_font_stats(doc: pymupdf.Document) -> tuple[str, bool]:
+    """Return (dominant_font_name, is_ocr_document).
+
+    A document is considered OCR if all text uses OCR-specific fonts
+    like GlyphLessFont (Tesseract) or similar invisible text fonts.
+    """
     font_counter: Counter[str] = Counter()
     for page in doc:
         blocks = page.get_text("dict", flags=pymupdf.TEXTFLAGS_TEXT)["blocks"]
@@ -41,9 +48,12 @@ def _get_dominant_font(doc: pymupdf.Document) -> str:
                     text = span["text"].strip()
                     if text:
                         font_counter[span["font"]] += len(text)
-    if font_counter:
-        return font_counter.most_common(1)[0][0]
-    return ""
+    if not font_counter:
+        return "", False
+
+    dominant = font_counter.most_common(1)[0][0]
+    all_ocr = all(f.lower() in _OCR_FONTS for f in font_counter)
+    return dominant, all_ocr
 
 
 def _is_handwriting_font(font_name: str) -> bool:
@@ -92,13 +102,16 @@ def _is_margin_paraph(span: dict, page_rect: pymupdf.Rect,
     return False
 
 
-def _clean_pdf(file_bytes: bytes) -> bytes:
+def _clean_pdf(file_bytes: bytes, is_ocr: bool, dominant_font: str) -> bytes:
     """Remove handwritten margin paraphs from a PDF, return cleaned PDF bytes.
 
+    Skipped for OCR documents (single font — heuristic won't work).
     Keeps dates, amounts, and all main-body text intact.
     """
+    if is_ocr:
+        return file_bytes
+
     doc = pymupdf.open(stream=file_bytes, filetype="pdf")
-    dominant_font = _get_dominant_font(doc)
 
     for page in doc:
         page_rect = page.rect
@@ -322,32 +335,209 @@ def _merge_broken_lines(md: str) -> str:
     return "\n\n".join(result_blocks).strip() + "\n"
 
 
+def _strip_ocr_backticks(md: str) -> str:
+    """Remove inline backtick wrapping that pymupdf4llm adds for monospace/OCR fonts.
+
+    Converts `word` `another` → word another
+    Also removes fenced code blocks wrapping normal text.
+    """
+    # Remove fenced code blocks that wrap regular text (not actual code)
+    md = re.sub(r"^```\s*$\n?", "", md, flags=re.MULTILINE)
+    # Remove inline backticks around words
+    md = re.sub(r"`([^`\n]+?)`", r"\1", md)
+    return md
+
+
+_VOWELS = set("aeiouyąęóAEIOUYĄĘÓ")
+
+
+def _is_garbage_word(word: str) -> bool:
+    """Check if a word looks like garbled OCR output."""
+    letters = [c for c in word if c.isalpha()]
+    if len(letters) < 3:
+        return False
+    vowels = sum(1 for c in letters if c in _VOWELS)
+    # Real Polish/English words have at least ~20% vowels
+    if vowels / len(letters) < 0.15:
+        return True
+    # Very long words without spaces are likely concatenated garbage
+    if len(letters) > 20:
+        return True
+    # Concatenated words: lowercase→uppercase transition mid-word (e.g. wpisówBrak)
+    transitions = sum(1 for i in range(1, len(word) - 1)
+                      if word[i].islower() and word[i + 1].isupper())
+    if transitions >= 2:
+        return True
+    return False
+
+
+def _is_garbage_line(line: str) -> bool:
+    """Check if a markdown line is OCR garbage that should be removed.
+
+    Strips markdown formatting before analysis.
+    """
+    # Strip markdown bold/italic markers for analysis
+    clean = re.sub(r"\*{1,2}|_{1,2}", "", line).strip()
+    if not clean:
+        return False
+
+    # Keep structural markdown
+    if _is_structural_line(line.strip()):
+        return False
+
+    # Line with very low letter ratio (lots of special chars)
+    letters = sum(1 for c in clean if c.isalpha())
+    if len(clean) > 5 and letters < len(clean) * 0.4:
+        return True
+
+    # Very short line (1-2 meaningful chars)
+    if len(clean) <= 2:
+        return True
+
+    # Lines with many pipe characters (OCR'd form borders)
+    if clean.count("|") >= 3:
+        return True
+
+    # Check words
+    words = clean.split()
+
+    # Lines with scattered single-letter words (OCR artifact from forms)
+    single_letter_words = sum(1 for w in words if len(w) == 1 and w.isalpha())
+    if len(words) >= 3 and single_letter_words > len(words) * 0.3:
+        return True
+
+    # Lines with long concatenated words (no spaces in OCR)
+    long_words = sum(1 for w in words if len(w) > 20)
+    if long_words > 0 and len(words) <= 3:
+        return True
+
+    # Lines where most words are garbage
+    if words:
+        garbage_count = sum(1 for w in words if _is_garbage_word(w))
+        if len(words) >= 2 and garbage_count > len(words) * 0.4:
+            return True
+        if len(words) == 1 and _is_garbage_word(words[0]):
+            return True
+
+    return False
+
+
+def _remove_garbage_ocr_lines(md: str) -> str:
+    """Remove lines that are clearly OCR garbage from scanned documents.
+
+    Two passes:
+    1. Tag each non-empty line as garbage or not
+    2. Detect the first point where garbage dominates (rolling window)
+       and truncate everything from there onward
+    """
+    lines = md.split("\n")
+    # First pass: tag lines
+    tagged: list[tuple[str, bool]] = []  # (line, is_garbage)
+    for line in lines:
+        if not line.strip():
+            tagged.append((line, False))
+        else:
+            tagged.append((line, _is_garbage_line(line)))
+
+    # Second pass: find truncation point using rolling window
+    WINDOW = 8
+    non_empty_count = 0
+    garbage_in_window: list[bool] = []
+    truncate_at = len(tagged)
+
+    for i, (line, is_garb) in enumerate(tagged):
+        if not line.strip():
+            continue
+        garbage_in_window.append(is_garb)
+        non_empty_count += 1
+        if len(garbage_in_window) > WINDOW:
+            garbage_in_window.pop(0)
+        # Check window: if >60% is garbage, truncate here
+        if (len(garbage_in_window) == WINDOW
+                and sum(garbage_in_window) > WINDOW * 0.6):
+            # Backtrack to the first garbage line in this window
+            backtrack = WINDOW
+            for j in range(i, -1, -1):
+                if not tagged[j][0].strip():
+                    continue
+                backtrack -= 1
+                if backtrack <= 0:
+                    truncate_at = j
+                    break
+            break
+
+    # Build result: keep lines up to truncation point, skip garbage
+    cleaned = []
+    for i, (line, is_garb) in enumerate(tagged):
+        if i >= truncate_at:
+            break
+        if is_garb:
+            continue
+        cleaned.append(line)
+
+    # Trim trailing blank lines
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+
+    return "\n".join(cleaned)
+
+
 def convert_pdf_to_markdown(file_bytes: bytes) -> str:
     """Convert PDF bytes to Markdown using pymupdf4llm.
 
     Pipeline:
-    1. Detect recurring headers/footers across pages
-    2. Remove handwritten margin paraphs
-    3. Convert to markdown via pymupdf4llm
-    4. Remove headers/footers and page numbers from output
-    5. Fix header formatting (redundant bold)
-    6. Merge broken lines into paragraphs
+    1. Analyze fonts — detect OCR documents
+    2. Detect recurring headers/footers across pages
+    3. Remove handwritten margin paraphs (non-OCR only)
+    4. Convert to markdown via pymupdf4llm
+    5. Strip OCR backtick artifacts (OCR only)
+    6. Remove garbage OCR lines (OCR only)
+    7. Remove headers/footers and page numbers
+    8. Fix header formatting (redundant bold)
+    9. Merge broken lines into paragraphs
     """
-    # Detect recurring texts before redaction
     doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+    dominant_font, is_ocr = _get_font_stats(doc)
     recurring = _find_recurring_texts(doc)
+
+    # For OCR: skip pages with very low text quality (garbled KRS appendixes, etc.)
+    good_pages = None
+    if is_ocr:
+        good_pages = []
+        clean_word_re = re.compile(
+            r'^[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ.,;:\-()"\'„"]+$'
+        )
+        for i in range(len(doc)):
+            text = doc[i].get_text()
+            words = text.split()
+            if not words:
+                continue
+            clean = sum(1 for w in words
+                        if clean_word_re.match(w) and 2 <= len(w) <= 30)
+            if clean / len(words) >= 0.55:
+                good_pages.append(i)
+        good_pages = good_pages or None
+
     doc.close()
 
-    cleaned_bytes = _clean_pdf(file_bytes)
+    cleaned_bytes = _clean_pdf(file_bytes, is_ocr, dominant_font)
 
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(cleaned_bytes)
         tmp_path = tmp.name
 
     try:
-        md_text = pymupdf4llm.to_markdown(tmp_path)
+        md_text = pymupdf4llm.to_markdown(
+            tmp_path,
+            pages=good_pages,
+            ignore_code=is_ocr,
+        )
     finally:
         os.unlink(tmp_path)
+
+    if is_ocr:
+        md_text = _strip_ocr_backticks(md_text)
+        md_text = _remove_garbage_ocr_lines(md_text)
 
     md_text = _remove_headers_footers(md_text, recurring)
     md_text = _remove_page_numbers(md_text)
