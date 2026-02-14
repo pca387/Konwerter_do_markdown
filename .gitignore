@@ -8,3 +8,7 @@ temp/
 *.egg-info/
 .venv/
 .DS_Store
+.claude/tsc-cache/
+.claude/context-monitor.json
+.claude/performance-optimization.json
+data/
