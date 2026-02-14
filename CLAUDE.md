@@ -37,6 +37,19 @@ Multi-stage processing:
 
 The line merger (`_merge_broken_lines`) is critical: pymupdf4llm separates every PDF line with `\n\n`. Real paragraph breaks are `\n\n\n`. The function splits on triple newlines, then merges continuation lines within each block. Special handling for list item continuations across block boundaries.
 
+### OCR Pre-processing (scanned PDFs)
+
+When a PDF has no text layer (pure image scan), automatic OCR kicks in before the main pipeline:
+
+1. **Detection** (`_needs_ocr`) — checks if <10% of pages have >50 characters of text
+2. **OCR** (`_ocr_pdf`) — runs `ocrmypdf` with `skip_text=True` (safe for mixed docs), `deskew=True` (straightens tilted scans), language `pol+eng`
+3. After OCR, the PDF has a GlyphLessFont text layer — the existing OCR pipeline handles it automatically
+
+**System requirements**:
+- macOS: `brew install tesseract tesseract-lang`
+- Docker: Tesseract packages installed in `.devcontainer/Dockerfile`
+- Python: `ocrmypdf` in `requirements.txt`
+
 ### DOCX Pipeline (`convert_docx_to_markdown`)
 
 Simpler: `mammoth` (DOCX→HTML) → `markdownify` (HTML→MD) → fix empty table headers.

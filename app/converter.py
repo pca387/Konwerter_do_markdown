@@ -33,6 +33,79 @@ _MEANINGFUL_RE = re.compile(
 _OCR_FONTS = {"glyphlessfont", "cid", "invisible"}
 
 
+def _needs_ocr(file_bytes: bytes, threshold: float = 0.10) -> bool:
+    """Check if a PDF is a pure image scan without a text layer.
+
+    Returns True if fewer than `threshold` fraction of pages contain
+    meaningful text (>50 characters). Fast — only extracts text, no OCR.
+    """
+    doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+    total = len(doc)
+    if total == 0:
+        doc.close()
+        return False
+    with_text = sum(1 for p in doc if len(p.get_text().strip()) > 50)
+    doc.close()
+    return with_text / total < threshold
+
+
+def _ocr_pdf(file_bytes: bytes, language: str = "pol+eng") -> bytes:
+    """Run OCR on a scanned PDF using ocrmypdf CLI, return PDF with text layer.
+
+    Uses --skip-text (safe for mixed documents) and --deskew
+    (straightens tilted scans for better OCR quality).
+
+    Called via subprocess because the ocrmypdf Python API conflicts with
+    PyMuPDF when running in the same process (produces empty text layers).
+    """
+    import subprocess
+
+    in_path = None
+    out_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_in:
+            tmp_in.write(file_bytes)
+            in_path = tmp_in.name
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_out:
+            out_path = tmp_out.name
+
+        result = subprocess.run(
+            [
+                "ocrmypdf",
+                "--skip-text",
+                "--deskew",
+                "--optimize", "0",
+                "-l", language,
+                in_path,
+                out_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if "PriorOcrFoundError" in stderr:
+                return file_bytes
+            if "tesseract" in stderr.lower() and "not found" in stderr.lower():
+                raise RuntimeError(
+                    "OCR wymaga zainstalowanego Tesseract. "
+                    "macOS: brew install tesseract tesseract-lang | "
+                    "Linux: apt install tesseract-ocr tesseract-ocr-pol"
+                )
+            raise RuntimeError(f"ocrmypdf error: {stderr}")
+
+        with open(out_path, "rb") as f:
+            return f.read()
+
+    finally:
+        if in_path and os.path.exists(in_path):
+            os.unlink(in_path)
+        if out_path and os.path.exists(out_path):
+            os.unlink(out_path)
+
+
 def _get_font_stats(doc: pymupdf.Document) -> tuple[str, bool]:
     """Return (dominant_font_name, is_ocr_document).
 
@@ -482,10 +555,11 @@ def _remove_garbage_ocr_lines(md: str) -> str:
     return "\n".join(cleaned)
 
 
-def convert_pdf_to_markdown(file_bytes: bytes) -> str:
+def convert_pdf_to_markdown(file_bytes: bytes, on_status=None) -> str:
     """Convert PDF bytes to Markdown using pymupdf4llm.
 
     Pipeline:
+    0. OCR if no text layer detected (scanned PDF)
     1. Analyze fonts — detect OCR documents
     2. Detect recurring headers/footers across pages
     3. Remove handwritten margin paraphs (non-OCR only)
@@ -496,6 +570,14 @@ def convert_pdf_to_markdown(file_bytes: bytes) -> str:
     8. Fix header formatting (redundant bold)
     9. Merge broken lines into paragraphs
     """
+    # Step 0: OCR if no text layer
+    if _needs_ocr(file_bytes):
+        if on_status:
+            on_status("Wykryto skan bez warstwy tekstowej. Uruchamianie OCR...")
+        file_bytes = _ocr_pdf(file_bytes)
+        if on_status:
+            on_status("OCR zakonczone. Przetwarzanie tekstu...")
+
     doc = pymupdf.open(stream=file_bytes, filetype="pdf")
     dominant_font, is_ocr = _get_font_stats(doc)
     recurring = _find_recurring_texts(doc)
