@@ -2,10 +2,120 @@ import io
 import re
 import tempfile
 import os
+from collections import Counter
 
+import pymupdf
 import pymupdf4llm
 import mammoth
 from markdownify import markdownify
+
+# Margin zone in points (1 point = 1/72 inch). Text spans falling inside
+# this zone AND matching the short-text heuristic are treated as paraphs.
+_MARGIN_LEFT = 50
+_MARGIN_RIGHT = 50
+_MARGIN_TOP = 36
+_MARGIN_BOTTOM = 36
+
+# Handwriting-style font name fragments (case-insensitive).
+_HANDWRITING_KEYWORDS = [
+    "script", "hand", "signature", "cursive", "brush",
+    "marker", "pen", "ink", "writing", "freestyle",
+]
+
+# Pattern: meaningful handwritten content (dates, amounts) we want to KEEP.
+_MEANINGFUL_RE = re.compile(
+    r"\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}"  # dates
+    r"|[\d\s,.]+\s*(zl|PLN|USD|EUR|pln|zł)"  # amounts with currency
+    r"|\d+[.,]\d{2}"  # decimal amounts
+)
+
+
+def _get_dominant_font(doc: pymupdf.Document) -> str:
+    """Return the single most frequently used font name across the document."""
+    font_counter: Counter[str] = Counter()
+    for page in doc:
+        blocks = page.get_text("dict", flags=pymupdf.TEXTFLAGS_TEXT)["blocks"]
+        for block in blocks:
+            for line in block.get("lines", []):
+                for span in line["spans"]:
+                    text = span["text"].strip()
+                    if text:
+                        font_counter[span["font"]] += len(text)
+    if font_counter:
+        return font_counter.most_common(1)[0][0]
+    return ""
+
+
+def _is_handwriting_font(font_name: str) -> bool:
+    low = font_name.lower()
+    return any(kw in low for kw in _HANDWRITING_KEYWORDS)
+
+
+def _span_in_margin(bbox: tuple, page_rect: pymupdf.Rect) -> bool:
+    """Check if a span's bounding box falls within the page margin zone."""
+    x0, y0, x1, y1 = bbox
+    return (
+        x0 < page_rect.x0 + _MARGIN_LEFT
+        or x1 > page_rect.x1 - _MARGIN_RIGHT
+        or y0 < page_rect.y0 + _MARGIN_TOP
+        or y1 > page_rect.y1 - _MARGIN_BOTTOM
+    )
+
+
+def _is_margin_paraph(span: dict, page_rect: pymupdf.Rect,
+                      dominant_font: str) -> bool:
+    """Decide whether a text span is a handwritten margin paraph to remove.
+
+    Keep the span if it contains meaningful content (dates, amounts).
+    """
+    text = span["text"].strip()
+    if not text:
+        return False
+
+    # Always keep meaningful content (dates, amounts)
+    if _MEANINGFUL_RE.search(text):
+        return False
+
+    in_margin = _span_in_margin(span["bbox"], page_rect)
+    is_hw_font = _is_handwriting_font(span["font"])
+    is_foreign_font = span["font"] != dominant_font
+    is_short = len(text) <= 4
+
+    # Definite paraph: handwriting font in margin
+    if is_hw_font and in_margin:
+        return True
+
+    # Short text in margin with a non-dominant font — likely initials/paraph
+    if in_margin and is_short and is_foreign_font:
+        return True
+
+    return False
+
+
+def _clean_pdf(file_bytes: bytes) -> bytes:
+    """Remove handwritten margin paraphs from a PDF, return cleaned PDF bytes.
+
+    Keeps dates, amounts, and all main-body text intact.
+    """
+    doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+    dominant_font = _get_dominant_font(doc)
+
+    for page in doc:
+        page_rect = page.rect
+        blocks = page.get_text("dict", flags=pymupdf.TEXTFLAGS_TEXT)["blocks"]
+
+        for block in blocks:
+            for line in block.get("lines", []):
+                for span in line["spans"]:
+                    if _is_margin_paraph(span, page_rect, dominant_font):
+                        rect = pymupdf.Rect(span["bbox"])
+                        page.add_redact_annot(rect)
+
+        page.apply_redactions()
+
+    cleaned = doc.tobytes()
+    doc.close()
+    return cleaned
 
 
 def _is_structural_line(line: str) -> bool:
@@ -82,10 +192,13 @@ def _merge_broken_lines(md: str) -> str:
 def convert_pdf_to_markdown(file_bytes: bytes) -> str:
     """Convert PDF bytes to Markdown using pymupdf4llm.
 
-    Faithful 1:1 conversion — no content modification or summarization.
+    Pre-processes the PDF to remove handwritten margin paraphs/initials
+    while keeping dates, amounts, and all typed content.
     """
+    cleaned_bytes = _clean_pdf(file_bytes)
+
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(file_bytes)
+        tmp.write(cleaned_bytes)
         tmp_path = tmp.name
 
     try:
