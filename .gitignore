@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .env
 output/
+outputs/*.md
 temp/
 *.egg-info/
 .venv/
